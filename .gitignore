@@ -1,4 +1,5 @@
 .env
+faiss_db/
 __pycache__/
 *.pyc
 *.pyo
