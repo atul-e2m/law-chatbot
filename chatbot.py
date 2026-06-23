@@ -15,8 +15,11 @@ import os
 import sys
 from pathlib import Path
 
+import pickle
+
 import anthropic
-import chromadb
+import faiss
+import numpy as np
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
@@ -28,8 +31,9 @@ from prompts import LEGAL_SYSTEM_PROMPT, LAYMAN_SYSTEM_PROMPT, USER_PROMPT_TEMPL
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-CHROMA_DIR = Path(__file__).parent / "chroma_db"
-COLLECTION_NAME = "legal_docs"
+FAISS_DIR = Path(__file__).parent / "faiss_db"
+INDEX_FILE = FAISS_DIR / "index.faiss"
+META_FILE = FAISS_DIR / "index.pkl"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
 
@@ -52,27 +56,20 @@ NO_CONTEXT_MESSAGE = (
 # ---------------------------------------------------------------------------
 
 def build_retriever():
-    """Connect to ChromaDB and return (collection, embedder)."""
-    if not CHROMA_DIR.exists():
+    """Load FAISS index + metadata and return (index, chunks, metadatas, embedder)."""
+    if not INDEX_FILE.exists() or not META_FILE.exists():
         print(
-            f"[ERROR] ChromaDB directory not found at {CHROMA_DIR}.\n"
+            f"[ERROR] FAISS index not found at {FAISS_DIR}.\n"
             "Run `python ingest.py` first."
         )
         sys.exit(1)
 
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-
-    try:
-        collection = client.get_collection(COLLECTION_NAME)
-    except Exception:
-        print(
-            f"[ERROR] Collection '{COLLECTION_NAME}' not found.\n"
-            "Run `python ingest.py` first."
-        )
-        sys.exit(1)
+    index = faiss.read_index(str(INDEX_FILE))
+    with open(META_FILE, "rb") as f:
+        store = pickle.load(f)
 
     embedder = SentenceTransformer(EMBEDDING_MODEL)
-    return collection, embedder
+    return index, store["chunks"], store["metadatas"], embedder
 
 
 def build_anthropic_client() -> anthropic.Anthropic:
@@ -91,27 +88,28 @@ def build_anthropic_client() -> anthropic.Anthropic:
 # Retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_context(query: str, collection, embedder, top_k: int = TOP_K) -> list[dict]:
+def retrieve_context(query: str, index, chunks, metadatas, embedder, top_k: int = TOP_K) -> list[dict]:
     """
-    Embed `query`, query ChromaDB, and return up to `top_k` result dicts.
+    Embed `query`, search the FAISS index, and return up to `top_k` result dicts.
     Each dict has keys: 'text', 'source', 'chunk_index'.
     """
-    query_embedding = embedder.encode([query], convert_to_list=True)[0]
+    query_embedding = embedder.encode([query], convert_to_numpy=True)
+    faiss.normalize_L2(query_embedding)
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, collection.count()),
-        include=["documents", "metadatas", "distances"],
-    )
+    k = min(top_k, index.ntotal)
+    _, indices = index.search(query_embedding, k)
 
-    chunks = []
-    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-        chunks.append({
-            "text": doc,
+    results = []
+    for idx in indices[0]:
+        if idx == -1:
+            continue
+        meta = metadatas[idx]
+        results.append({
+            "text": chunks[idx],
             "source": meta.get("source", "unknown"),
             "chunk_index": meta.get("chunk_index", 0),
         })
-    return chunks
+    return results
 
 
 def format_context(chunks: list[dict]) -> str:
@@ -202,11 +200,10 @@ def print_responses(legal: str, layman: str):
 
 def main():
     print("Initialising Law Firm RAG Chatbot...")
-    collection, embedder = build_retriever()
+    index, chunks, metadatas, embedder = build_retriever()
     anthropic_client = build_anthropic_client()
 
-    doc_count = collection.count()
-    print(f"Connected to ChromaDB. {doc_count} chunk(s) available.")
+    print(f"Connected to FAISS index. {index.ntotal} chunk(s) available.")
     print(f"Model: {CLAUDE_MODEL} | Top-k retrieval: {TOP_K}")
     print("\nType your legal question below. Type 'quit' or 'exit' to stop.\n")
     print_separator()
@@ -226,7 +223,7 @@ def main():
             break
 
         # Retrieval
-        chunks = retrieve_context(query, collection, embedder)
+        chunks = retrieve_context(query, index, chunks, metadatas, embedder)
 
         if not chunks:
             print(f"\n[INFO] {NO_CONTEXT_MESSAGE}\n")

@@ -1,6 +1,6 @@
 """
 ingest.py — Load legal documents from law_chatbot/docs/, chunk them,
-embed with sentence-transformers, and store in ChromaDB.
+embed with sentence-transformers, and store in a FAISS index.
 
 Usage:
     python ingest.py
@@ -8,10 +8,11 @@ Usage:
 
 import os
 import sys
+import pickle
 from pathlib import Path
 
-import chromadb
-from chromadb.config import Settings
+import numpy as np
+import faiss
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 
@@ -20,8 +21,9 @@ from pypdf import PdfReader
 # Configuration
 # ---------------------------------------------------------------------------
 DOCS_DIR = Path(__file__).parent / "docs"
-CHROMA_DIR = Path(__file__).parent / "chroma_db"
-COLLECTION_NAME = "legal_docs"
+FAISS_DIR = Path(__file__).parent / "faiss_db"
+INDEX_FILE = FAISS_DIR / "index.faiss"
+META_FILE = FAISS_DIR / "index.pkl"
 CHUNK_SIZE = 500        # tokens (approximated as words for simplicity)
 CHUNK_OVERLAP = 50      # tokens of overlap between consecutive chunks
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # fast, local, no API key required
@@ -88,7 +90,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def ingest():
-    """Ingest all supported documents found in DOCS_DIR into ChromaDB."""
+    """Ingest all supported documents found in DOCS_DIR into a FAISS index."""
 
     # Collect documents
     supported_extensions = {".pdf", ".txt"}
@@ -108,7 +110,6 @@ def ingest():
 
     # Load and chunk
     all_chunks: list[str] = []
-    all_ids: list[str] = []
     all_metadatas: list[dict] = []
 
     for doc_path in doc_paths:
@@ -122,9 +123,7 @@ def ingest():
         print(f"    -> {len(chunks)} chunk(s)")
 
         for idx, chunk in enumerate(chunks):
-            chunk_id = f"{doc_path.stem}__chunk_{idx:04d}"
             all_chunks.append(chunk)
-            all_ids.append(chunk_id)
             all_metadatas.append({
                 "source": doc_path.name,
                 "chunk_index": idx,
@@ -141,37 +140,25 @@ def ingest():
     print(f"Loading embedding model '{EMBEDDING_MODEL}' (first run downloads ~80 MB)...")
     embedder = SentenceTransformer(EMBEDDING_MODEL)
     print("Embedding chunks...")
-    embeddings = embedder.encode(all_chunks, show_progress_bar=True, convert_to_list=True)
+    embeddings = embedder.encode(all_chunks, show_progress_bar=True, convert_to_numpy=True)
 
-    # Store in ChromaDB
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    # Normalise for cosine similarity via inner product
+    faiss.normalize_L2(embeddings)
 
-    # Drop existing collection so re-runs start fresh
-    try:
-        client.delete_collection(COLLECTION_NAME)
-        print(f"Dropped existing collection '{COLLECTION_NAME}'.")
-    except Exception:
-        pass
+    # Build FAISS index (inner product on L2-normalised vectors = cosine similarity)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
 
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    # ChromaDB upsert in batches to stay within default limits
-    BATCH = 500
-    for i in range(0, len(all_chunks), BATCH):
-        collection.add(
-            ids=all_ids[i:i + BATCH],
-            documents=all_chunks[i:i + BATCH],
-            embeddings=embeddings[i:i + BATCH],
-            metadatas=all_metadatas[i:i + BATCH],
-        )
+    # Persist index and metadata
+    FAISS_DIR.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(INDEX_FILE))
+    with open(META_FILE, "wb") as f:
+        pickle.dump({"chunks": all_chunks, "metadatas": all_metadatas}, f)
 
     print(
         f"\nIngestion complete. {len(all_chunks)} chunks stored in "
-        f"ChromaDB collection '{COLLECTION_NAME}' at {CHROMA_DIR}."
+        f"FAISS index at {FAISS_DIR}."
     )
 
 
